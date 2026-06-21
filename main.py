@@ -22,8 +22,7 @@ def layer_norm(x, weight, bias, eps=1e-5):
     
     return y
 
-
-def block(h, i, seq_len):
+def attention(h, i, seq_len):
     ln_w = weights_dict[f'transformer.h.{i}.ln_1.weight']
     ln_b = weights_dict[f'transformer.h.{i}.ln_1.bias']
 
@@ -43,24 +42,23 @@ def block(h, i, seq_len):
     V = V.view(V.size(0), V.size(1), 12, 64).transpose(1, 2)
 
     scores = (Q @ K.transpose(-2, -1)) / math.sqrt(64)
-    mask = torch.tril(torch.ones(scores.size(-2), scores.size(-1)))
+    mask = torch.tril(torch.ones(scores.size(-2), scores.size(-1), device=scores.device))
     mask = mask.masked_fill(mask == 0, float('-inf'))
     weights = torch.softmax(scores + mask, dim=-1)
 
     out = weights @ V
 
-    out = out.transpose(1, 2).reshape(1, seq_len, 768)
+    out = out.transpose(1, 2).reshape(h.size(0), seq_len, 768)
 
 
     cproj_w = weights_dict[f'transformer.h.{i}.attn.c_proj.weight']
     cproj_b = weights_dict[f'transformer.h.{i}.attn.c_proj.bias']
 
     attn_out = out @ cproj_w + cproj_b
+    
+    return h + attn_out
 
-
-    h = h + attn_out
-
-
+def mlp(h, i):
     ln2_w = weights_dict[f'transformer.h.{i}.ln_2.weight']
     ln2_b = weights_dict[f'transformer.h.{i}.ln_2.bias']
 
@@ -71,26 +69,36 @@ def block(h, i, seq_len):
     
     return h + my_proj
 
+def block(h, i, seq_len):
+    h = attention(h, i, seq_len)
+    h = mlp(h, i)
+    
+    return h
 
+
+def forward_pass(token_ids):
+    embedding = get_embeddings(token_ids, weights_dict)
+    seq_len = token_ids.size(1)
+
+    h = embedding
+    for i in range(12):
+        h = block(h, i, seq_len)
+
+    h = layer_norm(h, weights_dict['transformer.ln_f.weight'], weights_dict['transformer.ln_f.bias'])
+    logits = h @ weights_dict['lm_head.weight'].T
+    return logits
 
 tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
 model = GPT2LMHeadModel.from_pretrained('gpt2')
 weights_dict = model.state_dict()
 
-text = "Hello, how are you"
+text = "His name is Emir"
 
 def multi_token_generate(text, max_new_tokens=1):
     token_ids = tokenizer.encode(text, return_tensors='pt')
     for _ in range(max_new_tokens):
-        embedding = get_embeddings(token_ids, weights_dict)
-        seq_len = token_ids.size(1)
-
-        h = embedding
-        for i in range(12):
-            h = block(h, i, seq_len)
-
-        h = layer_norm(h, weights_dict['transformer.ln_f.weight'], weights_dict['transformer.ln_f.bias'])
-        logits = h @ weights_dict['lm_head.weight'].T
+        logits = forward_pass(token_ids)
+        
         logits = logits[0, -1, :]
         token_id = torch.argmax(logits, dim=-1)
         token_ids = torch.cat([token_ids, token_id.unsqueeze(0).unsqueeze(0)], dim=1)
@@ -102,24 +110,24 @@ def hf_generate(text, max_new_tokens=1):
     out = model.generate(token_ids, max_new_tokens=max_new_tokens, do_sample=False)
     return tokenizer.decode(out[0])
 
+if __name__ == '__main__':
+    token_count = 25
 
-token_count = 25
+    next_5 = multi_token_generate(text, max_new_tokens=token_count)
 
-next_5 = multi_token_generate(text, max_new_tokens=token_count)
+    model.eval()
+    torch.manual_seed(42)
 
-model.eval()
-torch.manual_seed(42)
-
-# Tie pad token to suppress the warning
-model.config.pad_token_id = tokenizer.eos_token_id
-
-
-hf_next_5 = hf_generate(text, max_new_tokens=token_count)
+    # Tie pad token to suppress the warning
+    model.config.pad_token_id = tokenizer.eos_token_id
 
 
+    hf_next_5 = hf_generate(text, max_new_tokens=token_count)
 
-print(f"Your token: {next_5}")
-print(f"HF token:   {hf_next_5}")
-print(f"Match: {next_5 == hf_next_5}")
+
+
+    print(f"Your token: {next_5}")
+    print(f"HF token:   {hf_next_5}")
+    print(f"Match: {next_5 == hf_next_5}")
 
 
