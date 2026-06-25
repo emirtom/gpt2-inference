@@ -2,12 +2,10 @@
 import argparse
 import datetime
 import json
-import subprocess
 import time
 
 import torch
 import main
-
 
 
 def build_inputs(component, batch_size, seq_len, device):
@@ -54,18 +52,22 @@ def measure_memory(fn, device):
     return torch.cuda.max_memory_allocated() / 1e6
 
 
-def dispatch(component, inputs, device):
+def dispatch(component, inputs, device, variant='simple'):
     if component == 'embed':
-        return main.get_embeddings(inputs, main.weights_dict)
+        return main.get_embeddings(inputs)
     if component == 'layernorm':
         return main.layer_norm(*inputs)
     if component == 'attention':
         return main.attention(inputs, 0, inputs.size(1))
     if component == 'mlp':
+        if variant == 'fused':
+            return main.fused_mlp(inputs, 0)
         return main.mlp(inputs, 0)
     if component == 'block':
         return main.block(inputs, 0, inputs.size(1))
     if component == 'forward':
+        if variant == 'fused':
+            return main.fused_forward_pass(inputs)
         return main.forward_pass(inputs)
     raise ValueError(f'Unknown component: {component}')
 
@@ -90,7 +92,7 @@ def run_benchmark(args):
         else:
             inputs = build_inputs(args.component, args.batch_size, args.seq_len, device)
             def fn():
-                dispatch(args.component, inputs, device)
+                dispatch(args.component, inputs, device, args.variant)
 
         need_latency = args.mode in ('latency', 'throughput', 'all')
         need_memory = args.mode in ('memory', 'all')
@@ -106,7 +108,7 @@ def run_benchmark(args):
 
 
 def print_summary(args, r):
-    print(f"component={args.component}  mode={args.mode}  "
+    print(f"component={args.component}  variant={args.variant}  mode={args.mode}  "
           f"device={'cuda' if torch.cuda.is_available() else 'cpu'}  "
           f"batch={args.batch_size}  seq={args.seq_len}")
     if r['latency_ms'] is not None:
@@ -121,7 +123,7 @@ def print_summary(args, r):
 def log_results(args, r, device):
     record = {
         'timestamp': datetime.datetime.now().isoformat(),
-        'component': args.component, 'mode': args.mode,
+        'component': args.component, 'variant': args.variant, 'mode': args.mode,
         'batch_size': args.batch_size, 'seq_len': args.seq_len,
         'max_new_tokens': args.max_new_tokens,
         'warmup_iters': args.warmup_iters, 'bench_iters': args.bench_iters,
@@ -135,6 +137,9 @@ def entry():
     p = argparse.ArgumentParser(description='GPT-2 inference benchmark')
     p.add_argument('-c', '--component', required=True,
                    choices=['embed','layernorm','attention','mlp','block','forward','generate'])
+    p.add_argument('-v', '--variant', default='simple',
+                   choices=['simple', 'fused'],
+                   help='Which implementation to benchmark')
     p.add_argument('-m', '--mode', default='all',
                    choices=['latency','throughput','memory','all'])
     p.add_argument('-b', '--batch-size', type=int, default=1)

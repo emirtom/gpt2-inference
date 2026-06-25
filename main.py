@@ -1,83 +1,44 @@
-import math
-
-from transformers import GPT2Tokenizer, GPT2LMHeadModel
 import torch
+from transformers import GPT2Tokenizer, GPT2LMHeadModel
 
-def get_embeddings(token_ids, weights_dict):
-    wte = weights_dict['transformer.wte.weight']
-    wpe = weights_dict['transformer.wpe.weight']
-    positions = torch.arange(token_ids.size(1))
-    
-    embedding = wte[token_ids] + wpe[positions]
-    
-    
-    return embedding
+from simple.layernorm import layer_norm as _layer_norm
+from simple.embeddings import get_embeddings as _get_embeddings
+from simple.mlp import mlp as _mlp
+from simple.attention import attention as _attention
+from simple.block import block as _block
+from optimized.fused_ffn import fused_mlp as _fused_mlp
+
+
+# ---- Wrappers that bind the global weights_dict (matching old API) ----
+
+def get_embeddings(token_ids):
+    return _get_embeddings(token_ids, weights_dict)
+
 
 def layer_norm(x, weight, bias, eps=1e-5):
-    mean = torch.mean(x, dim=-1, keepdim=True)
-    variance = torch.var(x, dim=-1, keepdim=True, unbiased=False)
-    normalized = (x - mean) / torch.sqrt(variance + eps)
-    y = normalized * weight + bias
-    
-    
-    return y
+    return _layer_norm(x, weight, bias, eps)
+
 
 def attention(h, i, seq_len):
-    ln_w = weights_dict[f'transformer.h.{i}.ln_1.weight']
-    ln_b = weights_dict[f'transformer.h.{i}.ln_1.bias']
+    return _attention(h, i, seq_len, weights_dict)
 
-    my_ln = layer_norm(h, ln_w, ln_b)
-
-
-
-    c_attn_w = weights_dict[f'transformer.h.{i}.attn.c_attn.weight']
-    c_attn_b = weights_dict[f'transformer.h.{i}.attn.c_attn.bias']
-
-    QKV = my_ln @ c_attn_w + c_attn_b
-    Q, K, V = QKV.chunk(3, dim=-1)
-    
-    
-    Q = Q.view(Q.size(0), Q.size(1), 12, 64).transpose(1, 2)
-    K = K.view(K.size(0), K.size(1), 12, 64).transpose(1, 2)
-    V = V.view(V.size(0), V.size(1), 12, 64).transpose(1, 2)
-
-    scores = (Q @ K.transpose(-2, -1)) / math.sqrt(64)
-    mask = torch.tril(torch.ones(scores.size(-2), scores.size(-1), device=scores.device))
-    mask = mask.masked_fill(mask == 0, float('-inf'))
-    weights = torch.softmax(scores + mask, dim=-1)
-
-    out = weights @ V
-
-    out = out.transpose(1, 2).reshape(h.size(0), seq_len, 768)
-
-
-    cproj_w = weights_dict[f'transformer.h.{i}.attn.c_proj.weight']
-    cproj_b = weights_dict[f'transformer.h.{i}.attn.c_proj.bias']
-
-    attn_out = out @ cproj_w + cproj_b
-    
-    return h + attn_out
 
 def mlp(h, i):
-    ln2_w = weights_dict[f'transformer.h.{i}.ln_2.weight']
-    ln2_b = weights_dict[f'transformer.h.{i}.ln_2.bias']
+    return _mlp(h, i, weights_dict)
 
-    my_ln2  = layer_norm(h, ln2_w, ln2_b)
-    my_fc   = my_ln2 @ weights_dict[f'transformer.h.{i}.mlp.c_fc.weight'] + weights_dict[f'transformer.h.{i}.mlp.c_fc.bias']
-    my_act  = torch.nn.functional.gelu(my_fc, approximate='tanh')
-    my_proj = my_act @ weights_dict[f'transformer.h.{i}.mlp.c_proj.weight'] + weights_dict[f'transformer.h.{i}.mlp.c_proj.bias']
-    
-    return h + my_proj
 
 def block(h, i, seq_len):
-    h = attention(h, i, seq_len)
-    h = mlp(h, i)
-    
-    return h
+    return _block(h, i, seq_len, weights_dict)
 
+
+def fused_mlp(h, i):
+    return _fused_mlp(h, i, weights_dict)
+
+
+# ---- Full forward passes ----
 
 def forward_pass(token_ids):
-    embedding = get_embeddings(token_ids, weights_dict)
+    embedding = get_embeddings(token_ids)
     seq_len = token_ids.size(1)
 
     h = embedding
@@ -88,46 +49,56 @@ def forward_pass(token_ids):
     logits = h @ weights_dict['lm_head.weight'].T
     return logits
 
+
+def fused_forward_pass(token_ids):
+    embedding = get_embeddings(token_ids)
+    seq_len = token_ids.size(1)
+
+    h = embedding
+    for i in range(12):
+        h = attention(h, i, seq_len)
+        h = fused_mlp(h, i)
+
+    h = layer_norm(h, weights_dict['transformer.ln_f.weight'], weights_dict['transformer.ln_f.bias'])
+    logits = h @ weights_dict['lm_head.weight'].T
+    return logits
+
+# ---- Model loading ----
+
 tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
 model = GPT2LMHeadModel.from_pretrained('gpt2')
 weights_dict = model.state_dict()
 
-text = "His name is Emir"
+
+# ---- Generation ----
 
 def multi_token_generate(text, max_new_tokens=1):
     token_ids = tokenizer.encode(text, return_tensors='pt')
     for _ in range(max_new_tokens):
         logits = forward_pass(token_ids)
-        
         logits = logits[0, -1, :]
         token_id = torch.argmax(logits, dim=-1)
         token_ids = torch.cat([token_ids, token_id.unsqueeze(0).unsqueeze(0)], dim=1)
-    
     return tokenizer.decode(token_ids[0])
+
 
 def hf_generate(text, max_new_tokens=1):
     token_ids = tokenizer.encode(text, return_tensors='pt')
     out = model.generate(token_ids, max_new_tokens=max_new_tokens, do_sample=False)
     return tokenizer.decode(out[0])
 
-if __name__ == '__main__':
-    token_count = 25
 
-    next_5 = multi_token_generate(text, max_new_tokens=token_count)
+if __name__ == '__main__':
+    text = "His name is Emir"
+    token_count = 25
 
     model.eval()
     torch.manual_seed(42)
-
-    # Tie pad token to suppress the warning
     model.config.pad_token_id = tokenizer.eos_token_id
 
+    next_tokens = multi_token_generate(text, max_new_tokens=token_count)
+    hf_next_tokens = hf_generate(text, max_new_tokens=token_count)
 
-    hf_next_5 = hf_generate(text, max_new_tokens=token_count)
-
-
-
-    print(f"Your token: {next_5}")
-    print(f"HF token:   {hf_next_5}")
-    print(f"Match: {next_5 == hf_next_5}")
-
-
+    print(f"Your token: {next_tokens}")
+    print(f"HF token:   {hf_next_tokens}")
+    print(f"Match: {next_tokens == hf_next_tokens}")
